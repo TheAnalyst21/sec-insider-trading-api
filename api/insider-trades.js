@@ -1,570 +1,841 @@
-// api/insider-trades.js - ERWEITERTE VERSION: Form 4 + Form 144 Support
-export default async function handler(req, res) {
-  // Dynamische Imports
-  const fetch = (await import('node-fetch')).default;
-  const xml2js = await import('xml2js');
-
-  // CORS Headers
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-  
-  if (req.method !== 'GET') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
-
-  // In-Memory Cache
-  const cache = new Map();
-  const CACHE_DURATION = 5 * 60 * 1000; // 5 Minuten
-
-  // Bekannte CIKs für häufig gesuchte Unternehmen
-  const COMPANY_CIKS = {
-    'TSLA': '0001318605',
-    'AAPL': '0000320193', 
-    'MSFT': '0000789019',
-    'GOOGL': '0001652044',
-    'GOOG': '0001652044',
-    'AMZN': '0001018724',
-    'META': '0001326801',
-    'NVDA': '0001045810',
-    'BTBT': '0001710350',
-    'AMD': '0000002488',
-    'NFLX': '0001065280',
-    'INTC': '0000050863',
-    'ORCL': '0001341439',
-    'CRM': '0001108524',
-    'ADBE': '0000796343'
-  };
-
-  // Rate Limiting
-  const requestTimes = [];
-  const MAX_REQUESTS_PER_SECOND = 8;
-
-  function checkRateLimit() {
-    const now = Date.now();
-    const oneSecondAgo = now - 1000;
-    
-    while (requestTimes.length > 0 && requestTimes[0] < oneSecondAgo) {
-      requestTimes.shift();
-    }
-    
-    if (requestTimes.length >= MAX_REQUESTS_PER_SECOND) {
-      const waitTime = requestTimes[0] + 1000 - now;
-      return waitTime;
-    }
-    
-    requestTimes.push(now);
-    return 0;
-  }
-
-  async function fetchWithRetry(url, options = {}, retries = 3) {
-    for (let i = 0; i < retries; i++) {
-      try {
-        const waitTime = checkRateLimit();
-        if (waitTime > 0) {
-          await new Promise(resolve => setTimeout(resolve, waitTime));
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live Insider Trading Feed</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
-        
-        const response = await fetch(url, {
-          ...options,
-          headers: {
-            'User-Agent': 'SEC-Insider-Trading-API contact@yoursite.com',
-            'Accept': 'application/json, text/xml, */*',
-            'Accept-Encoding': 'gzip, deflate',
-            ...options.headers
-          }
-        });
-        
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #000;
+            color: #fff;
+            padding: 20px;
+            min-height: 100vh;
         }
-        
-        return response;
-      } catch (error) {
-        console.warn(`Attempt ${i + 1} failed:`, error.message);
-        if (i === retries - 1) throw error;
-        await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
-      }
-    }
-  }
 
-  async function getCIKFromTicker(ticker) {
-    const upperTicker = ticker.toUpperCase();
-    return COMPANY_CIKS[upperTicker] || null;
-  }
-
-  async function fetchCompanySubmissions(cik) {
-    const cacheKey = `submissions_${cik}`;
-    if (cache.has(cacheKey)) {
-      const cached = cache.get(cacheKey);
-      if (Date.now() - cached.timestamp < CACHE_DURATION) {
-        return cached.data;
-      }
-    }
-    
-    const url = `https://data.sec.gov/submissions/CIK${cik}.json`;
-    const response = await fetchWithRetry(url);
-    const data = await response.json();
-    
-    cache.set(cacheKey, { data, timestamp: Date.now() });
-    return data;
-  }
-
-  // Neue Funktion: Parse Form 144 (Intent to Sell Notices)
-  async function parseForm144Data(submissions, cik, maxFilings = 5) {
-    const form144Trades = [];
-    const form144Indices = [];
-    
-    submissions.filings.recent.form.forEach((form, index) => {
-      if (form === '144') {
-        form144Indices.push(index);
-      }
-    });
-    
-    console.log(`Found ${form144Indices.length} Form 144 filings for CIK ${cik}`);
-    
-    // Nehme die neuesten Form 144s
-    const maxToProcess = Math.min(form144Indices.length, maxFilings);
-    
-    for (let i = 0; i < maxToProcess; i++) {
-      const idx = form144Indices[i];
-      const accessionNumber = submissions.filings.recent.accessionNumber[idx];
-      const filingDate = submissions.filings.recent.reportDate[idx];
-      
-      try {
-        // Form 144 ist meist ein einfaches Format, erstelle synthetische Daten
-        const companyName = submissions.name || 'Unknown Company';
-        const ticker = submissions.tickers?.[0] || '';
-        
-        // Form 144 zeigt meist "Intent to Sell" - erstelle eine synthetische Transaktion
-        form144Trades.push({
-          personName: "Insider (Form 144)",
-          title: "Director/Officer", 
-          companyName,
-          ticker,
-          shares: 0, // Form 144 zeigt oft nicht genaue Anzahl
-          price: 0,
-          totalValue: 0,
-          sharesAfter: 0,
-          transactionDate: filingDate,
-          filingDate,
-          transactionType: "D", // Disposal/Intent to Sell
-          transactionCode: "144", // Special code for Form 144
-          securityTitle: "Common Stock",
-          ownershipForm: "D",
-          footnotes: `Form 144 - Intent to Sell Notice (${accessionNumber})`,
-          isForm144: true
-        });
-        
-        console.log(`Added Form 144 entry for ${accessionNumber}`);
-      } catch (error) {
-        console.warn(`Failed to process Form 144 ${accessionNumber}:`, error.message);
-      }
-    }
-    
-    return form144Trades;
-  }
-
-  async function fetchForm4XML(accessionNumber, cik) {
-    const cacheKey = `form4_${accessionNumber}`;
-    if (cache.has(cacheKey)) {
-      const cached = cache.get(cacheKey);
-      if (Date.now() - cached.timestamp < CACHE_DURATION) {
-        return cached.data;
-      }
-    }
-    
-    try {
-      const cleanAccession = accessionNumber.replace(/-/g, '');
-      const xmlUrl = `https://www.sec.gov/Archives/edgar/data/${parseInt(cik)}/${cleanAccession}/ownership.xml`;
-      
-      console.log(`Fetching XML: ${xmlUrl}`);
-      const response = await fetchWithRetry(xmlUrl);
-      const xmlText = await response.text();
-      
-      console.log(`XML Response length: ${xmlText.length}`);
-      
-      const parsedData = await parseForm4XML(xmlText, accessionNumber);
-      
-      cache.set(cacheKey, { data: parsedData, timestamp: Date.now() });
-      return parsedData;
-    } catch (error) {
-      console.warn('XML fetch failed for', accessionNumber, error.message);
-      return { error: error.message, accessionNumber };
-    }
-  }
-
-  async function parseForm4XML(xmlText, accessionNumber) {
-    try {
-      console.log(`\n=== PARSING XML FOR ${accessionNumber} ===`);
-      
-      const parser = new xml2js.Parser({ 
-        explicitArray: false,
-        mergeAttrs: false,
-        normalizeTags: false,
-        normalize: false,
-        trim: true,
-        explicitRoot: true
-      });
-      
-      const result = await parser.parseStringPromise(xmlText);
-      
-      // Finde das ownership document
-      let doc;
-      if (result.ownershipDocument) {
-        doc = result.ownershipDocument;
-      } else if (result.OwnershipDocument) {
-        doc = result.OwnershipDocument;
-      } else {
-        console.log('Available root keys:', Object.keys(result));
-        return { error: 'No ownership document found', structure: Object.keys(result) };
-      }
-      
-      // Parse Reporting Person Info
-      const reportingOwner = doc.reportingOwner || doc.ReportingOwner;
-      if (!reportingOwner) {
-        return { error: 'No reporting owner found', docKeys: Object.keys(doc) };
-      }
-      
-      const reportingOwnerId = reportingOwner.reportingOwnerId || reportingOwner.ReportingOwnerId || {};
-      const relationship = reportingOwner.reportingOwnerRelationship || reportingOwner.ReportingOwnerRelationship || {};
-      
-      const personName = (reportingOwnerId.rptOwnerName || reportingOwnerId.RptOwnerName || 'Unknown').trim();
-      
-      // Relationship parsing
-      const isDirector = (relationship.isDirector || relationship.IsDirector) === '1';
-      const isOfficer = (relationship.isOfficer || relationship.IsOfficer) === '1';
-      const isTenPercentOwner = (relationship.isTenPercentOwner || relationship.IsTenPercentOwner) === '1';
-      const officerTitle = (relationship.officerTitle || relationship.OfficerTitle || '').trim();
-      
-      let title = '';
-      if (isDirector) title = 'Director';
-      if (isOfficer && officerTitle) title = officerTitle;
-      if (isTenPercentOwner) title = title ? title + ', 10% Owner' : '10% Owner';
-      if (!title) title = 'Insider';
-      
-      // Parse Company Info
-      const issuer = doc.issuer || doc.Issuer || {};
-      const companyName = (issuer.issuerName || issuer.IssuerName || 'Unknown Company').trim();
-      const ticker = (issuer.issuerTradingSymbol || issuer.IssuerTradingSymbol || '').trim();
-      
-      // Parse Filing Date
-      const filingDate = doc.documentDate || doc.DocumentDate || doc.periodOfReport || '';
-      
-      // Parse Non-Derivative Transactions
-      const transactions = [];
-      let nonDerivativeTable = doc.nonDerivativeTable || doc.NonDerivativeTable;
-      
-      if (nonDerivativeTable) {
-        let nonDerivativeTransactions = nonDerivativeTable.nonDerivativeTransaction || nonDerivativeTable.NonDerivativeTransaction;
-        
-        if (!Array.isArray(nonDerivativeTransactions)) {
-          nonDerivativeTransactions = nonDerivativeTransactions ? [nonDerivativeTransactions] : [];
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
         }
-        
-        console.log(`Found ${nonDerivativeTransactions.length} transactions`);
-        
-        nonDerivativeTransactions.forEach((transaction, index) => {
-          if (!transaction) return;
-          
-          try {
-            const securityTitle = (
-              transaction.securityTitle?.value || 
-              transaction.SecurityTitle?.Value || 
-              transaction.securityTitle || 
-              'Common Stock'
-            ).trim();
-            
-            const transactionDate = (
-              transaction.transactionDate?.value || 
-              transaction.TransactionDate?.Value ||
-              transaction.transactionDate ||
-              ''
-            ).trim();
-            
-            const transactionCoding = transaction.transactionCoding || transaction.TransactionCoding || {};
-            const transactionCode = (
-              transactionCoding.transactionCode || 
-              transactionCoding.TransactionCode ||
-              transactionCoding.code ||
-              ''
-            ).trim();
-            
-            const amounts = transaction.transactionAmounts || transaction.TransactionAmounts;
-            if (!amounts) return;
-            
-            const sharesField = amounts.transactionShares || amounts.TransactionShares;
-            const shares = parseFloat(
-              sharesField?.value || 
-              sharesField?.Value ||
-              sharesField ||
-              '0'
-            );
-            
-            const priceField = amounts.transactionPricePerShare || amounts.TransactionPricePerShare;
-            const price = parseFloat(
-              priceField?.value || 
-              priceField?.Value ||
-              priceField ||
-              '0'
-            );
-            
-            const disposalField = amounts.transactionAcquiredDisposedCode || amounts.TransactionAcquiredDisposedCode;
-            const acquiredDisposedCode = (
-              disposalField?.value || 
-              disposalField?.Value ||
-              disposalField ||
-              ''
-            ).trim();
-            
-            const postTransaction = transaction.postTransactionAmounts || transaction.PostTransactionAmounts;
-            let sharesAfter = 0;
-            if (postTransaction) {
-              const sharesAfterField = postTransaction.sharesOwnedFollowingTransaction || 
-                                     postTransaction.SharesOwnedFollowingTransaction;
-              sharesAfter = parseFloat(
-                sharesAfterField?.value || 
-                sharesAfterField?.Value ||
-                sharesAfterField ||
-                '0'
-              );
+
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            background: linear-gradient(45deg, #00ff88, #00cc6a);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+
+        .refresh-btn, .input-group button {
+            background: linear-gradient(45deg, #00ff88, #00cc6a);
+            color: #000;
+            border: none;
+            padding: 12px 25px;
+            border-radius: 8px;
+            font-weight: bold;
+            cursor: pointer;
+            font-size: 16px;
+            transition: transform 0.2s ease;
+        }
+
+        .refresh-btn:hover, .input-group button:hover {
+            transform: scale(1.05);
+        }
+
+        .refresh-btn:disabled, .input-group button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .input-group {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .input-group input {
+            background: #111;
+            border: 1px solid #333;
+            color: #fff;
+            padding: 10px 15px;
+            border-radius: 6px;
+            font-size: 14px;
+            width: 120px;
+        }
+
+        .input-group input:focus {
+            outline: none;
+            border-color: #00ff88;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            font-size: 18px;
+            color: #888;
+        }
+
+        .spinner {
+            display: inline-block;
+            width: 30px;
+            height: 30px;
+            border: 3px solid #333;
+            border-top: 3px solid #00ff88;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-right: 10px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .trade-card {
+            background: #111;
+            border-radius: 15px;
+            padding: 25px;
+            margin-bottom: 20px;
+            border: 1px solid #333;
+            transition: all 0.3s ease;
+            cursor: pointer;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .trade-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(45deg, rgba(0,255,136,0.1), rgba(0,204,106,0.1));
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+
+        .trade-card:hover::before {
+            opacity: 1;
+        }
+
+        .trade-card:hover {
+            transform: translateY(-2px);
+            border-color: #00ff88;
+            box-shadow: 0 10px 30px rgba(0,255,136,0.2);
+        }
+
+        .metrics-row {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+
+        .metric {
+            background: #1a1a1a;
+            padding: 12px 18px;
+            border-radius: 8px;
+            border: 1px solid #333;
+            flex: 1;
+            min-width: 120px;
+            text-align: center;
+        }
+
+        .metric.buy {
+            border-color: #00ff88;
+            background: rgba(0,255,136,0.1);
+        }
+
+        .metric.sell {
+            border-color: #ff4444;
+            background: rgba(255,68,68,0.1);
+        }
+
+        .metric-value {
+            font-size: 1.8em;
+            font-weight: bold;
+            margin-bottom: 4px;
+        }
+
+        .metric-value.buy {
+            color: #00ff88;
+        }
+
+        .metric-value.sell {
+            color: #ff4444;
+        }
+
+        .metric-label {
+            font-size: 0.9em;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .transaction-description {
+            font-size: 1.3em;
+            margin-bottom: 15px;
+            font-weight: 500;
+        }
+
+        .transaction-description.buy {
+            color: #00ff88;
+        }
+
+        .transaction-description.sell {
+            color: #ff4444;
+        }
+
+        .company-info {
+            margin-bottom: 15px;
+        }
+
+        .company-name {
+            font-size: 1.8em;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+
+        .person-info {
+            margin-bottom: 10px;
+        }
+
+        .person-name {
+            font-size: 1.4em;
+            font-weight: 600;
+            margin-bottom: 3px;
+        }
+
+        .person-title {
+            color: #888;
+            font-size: 1.1em;
+        }
+
+        .date-info {
+            color: #666;
+            font-size: 1em;
+            margin-top: 15px;
+        }
+
+        .error {
+            background: #331;
+            border: 1px solid #f44;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+            color: #faa;
+        }
+
+        .footnote {
+            background: #1a1a1a;
+            border-left: 3px solid #00ff88;
+            padding: 10px 15px;
+            margin-top: 15px;
+            font-size: 0.9em;
+            color: #ccc;
+            border-radius: 0 5px 5px 0;
+        }
+
+        .status {
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 20px;
+            font-size: 14px;
+        }
+
+        .status.success {
+            border-color: #00ff88;
+            background: rgba(0,255,136,0.1);
+        }
+
+        .status.warning {
+            border-color: #ffaa00;
+            background: rgba(255,170,0,0.1);
+            color: #ffaa00;
+        }
+
+        @media (max-width: 600px) {
+            .metrics-row {
+                flex-direction: column;
             }
             
-            if (shares > 0 && !isNaN(shares)) {
-              const trade = {
-                personName,
-                title,
-                companyName,
-                ticker,
-                shares: Math.round(shares),
-                price: price || 0,
-                totalValue: Math.round(shares * (price || 0)),
-                sharesAfter: Math.round(sharesAfter) || 0,
-                transactionDate,
-                filingDate,
-                transactionType: acquiredDisposedCode, // A = Acquired, D = Disposed
-                transactionCode, // P = Purchase, S = Sale, etc.
-                securityTitle,
-                ownershipForm: 'D',
-                footnotes: null,
-                isForm144: false
-              };
-              
-              transactions.push(trade);
-              console.log('✅ Valid transaction added');
+            .metric {
+                min-width: auto;
             }
-          } catch (parseError) {
-            console.warn('Error parsing individual transaction:', parseError.message);
-          }
-        });
-      }
-      
-      console.log(`\n=== FINAL RESULT: ${transactions.length} transactions ===`);
-      
-      return { 
-        transactions, 
-        debug: {
-          personName,
-          companyName,
-          ticker,
-          filingDate,
-          transactionCount: transactions.length
-        }
-      };
-      
-    } catch (error) {
-      console.error('XML parsing error:', error.message);
-      return { 
-        error: `XML parsing failed: ${error.message}`, 
-        rawXmlPreview: xmlText.substring(0, 1000) 
-      };
-    }
-  }
-
-  // Haupthandler
-  try {
-    const { ticker, latest, limit = 10, debug = false, includeForm144 = true } = req.query;
-    
-    if (latest === 'true') {
-      // Erweiterte Liste mit Fokus auf aktive Insider Trading Unternehmen
-      const activeTickerList = ['BTBT', 'NVDA', 'AMD', 'CRM', 'TSLA', 'AAPL']; 
-      const allTrades = [];
-      const debugInfo = [];
-      
-      for (const t of activeTickerList) {
-        try {
-          const cik = await getCIKFromTicker(t);
-          if (!cik) continue;
-          
-          const submissions = await fetchCompanySubmissions(cik);
-          
-          // Form 4 Filings
-          const form4Indices = [];
-          submissions.filings.recent.form.forEach((form, index) => {
-            if (form === '4' || form === '4/A') {
-              form4Indices.push(index);
-            }
-          });
-          
-          // Form 4 Processing
-          if (form4Indices.length > 0) {
-            const maxToCheck = Math.min(form4Indices.length, 3);
             
-            for (let i = 0; i < maxToCheck; i++) {
-              const idx = form4Indices[i];
-              const accessionNumber = submissions.filings.recent.accessionNumber[idx];
-              const filingDate = submissions.filings.recent.reportDate[idx];
-              
-              const result = await fetchForm4XML(accessionNumber, cik);
-              
-              if (result && result.transactions) {
-                allTrades.push(...result.transactions);
-                debugInfo.push({
-                  ticker: t,
-                  accessionNumber,
-                  filingDate,
-                  type: 'Form 4',
-                  transactionCount: result.transactions.length
+            .header h1 {
+                font-size: 2em;
+            }
+
+            .controls {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📈 Live Insider Trading Feed</h1>
+            <p>Echte SEC Form 4 Filings</p>
+        </div>
+
+        <div class="controls">
+            <button class="refresh-btn" onclick="loadLatestFilings()" id="refreshBtn">
+                🔄 Neueste Filings laden
+            </button>
+            
+            <div class="input-group">
+                <input type="text" id="tickerInput" placeholder="Ticker (z.B. TSLA)" maxlength="5">
+                <button onclick="loadCompanyFilings()" id="searchBtn">🔍 Suchen</button>
+            </div>
+        </div>
+
+        <div id="status"></div>
+        <div id="content">
+            <div class="loading">
+                <div class="spinner"></div>
+                Verbinde mit SEC EDGAR API...
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Backend API Configuration
+        // 🔥 WICHTIG: Ersetze diese URL mit deiner echten Vercel URL
+        const BACKEND_API_URL = 'https://DEINE-VERCEL-URL.vercel.app/api/insider-trades';
+        // Beispiel: 'https://sec-insider-trading-api-xyz123.vercel.app/api/insider-trades'
+        
+        let currentFilings = [];
+
+        function showStatus(message, type = 'info') {
+            const status = document.getElementById('status');
+            const className = type === 'success' ? 'status success' : 
+                             type === 'warning' ? 'status warning' : 'status';
+            status.innerHTML = `<div class="${className}">${message}</div>`;
+        }
+
+        function formatNumber(num) {
+            if (num >= 1000000) {
+                return (num / 1000000).toFixed(1) + 'M';
+            } else if (num >= 1000) {
+                return (num / 1000).toFixed(0) + 'K';
+            }
+            return num.toLocaleString();
+        }
+
+        function formatCurrency(amount) {
+            if (amount >= 1000000) {
+                return '$' + (amount / 1000000).toFixed(1) + 'M';
+            } else if (amount >= 1000) {
+                return '$' + (amount / 1000).toFixed(0) + 'K';
+            }
+            return '$' + amount.toLocaleString();
+        }
+
+        function formatDate(dateStr) {
+            const date = new Date(dateStr);
+            const today = new Date();
+            const diffTime = Math.abs(today - date);
+            const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+            
+            if (diffDays === 1) {
+                return 'Heute';
+            } else if (diffDays === 2) {
+                return 'Gestern';
+            } else if (diffDays <= 7) {
+                return `vor ${diffDays-1} Tagen`;
+            }
+            
+            return date.toLocaleDateString('de-DE');
+        }
+
+        async function fetchInsiderTrades(ticker = null, latest = false) {
+            const params = new URLSearchParams();
+            
+            if (latest) {
+                params.append('latest', 'true');
+                params.append('limit', '20');
+                params.append('includeForm144', 'true'); // NEW: Form 144 Support
+            } else if (ticker) {
+                params.append('ticker', ticker.toUpperCase());
+                params.append('limit', '15');
+                params.append('includeForm144', 'true'); // NEW: Form 144 Support
+                params.append('debug', 'true'); // NEW: Debug für Ticker-Suchen
+            } else {
+                throw new Error('Either ticker or latest=true must be specified');
+            }
+            
+            const url = `${BACKEND_API_URL}?${params}`;
+            
+            try {
+                const response = await fetch(url, {
+                    method: 'GET',
+                    headers: {
+                        'Accept': 'application/json',
+                        'Content-Type': 'application/json'
+                    }
                 });
-              }
+                
+                if (!response.ok) {
+                    const errorData = await response.json().catch(() => ({}));
+                    throw new Error(errorData.error || `HTTP ${response.status}: ${response.statusText}`);
+                }
+                
+                const data = await response.json();
+                
+                if (!data.success) {
+                    throw new Error(data.error || 'API returned unsuccessful response');
+                }
+                
+                return {
+                    trades: data.trades || [],
+                    debug: data.debug || null,
+                    includedTypes: data.includedTypes || ['Form 4'],
+                    form4Count: data.form4Count || 0
+                };
+                
+            } catch (error) {
+                if (error.name === 'TypeError' && error.message.includes('fetch')) {
+                    throw new Error('Backend Service nicht erreichbar. Prüfe deine BACKEND_API_URL: ' + BACKEND_API_URL);
+                }
+                throw error;
             }
-          }
-          
-          // Form 144 Processing (falls eingeschaltet)
-          if (includeForm144 === 'true') {
-            const form144Trades = await parseForm144Data(submissions, cik, 2);
-            if (form144Trades.length > 0) {
-              allTrades.push(...form144Trades);
-              debugInfo.push({
-                ticker: t,
-                type: 'Form 144',
-                transactionCount: form144Trades.length
-              });
+        }
+
+        function getTransactionDescription(trade) {
+            const isBuy = trade.transactionType === 'A';
+            const action = isBuy ? 'GEKAUFT' : 'VERKAUFT';
+            const shares = formatNumber(trade.shares);
+            const price = `${trade.price.toFixed(2)}`;
+            const emoji = isBuy ? '🟢' : '🔴';
+            
+            return `${emoji} ${action} ${shares} Aktien @ ${price}`;
+        }
+
+        function calculateOwnership(sharesAfter, totalShares = 10000000) {
+            return ((sharesAfter / totalShares) * 100).toFixed(1) + '%';
+        }
+
+        function renderTradeCard(trade) {
+            const isBuy = trade.transactionType === 'A';
+            const isForm144 = trade.isForm144 || trade.transactionCode === '144';
+            
+            let buyClass, actionText, emoji;
+            
+            if (isForm144) {
+                buyClass = 'sell';
+                actionText = 'VERKAUFS-ANKÜNDIGUNG';
+                emoji = '🔔';
+            } else {
+                buyClass = isBuy ? 'buy' : 'sell';
+                actionText = isBuy ? 'GEKAUFT' : 'VERKAUFT';
+                emoji = isBuy ? '🟢' : '🔴';
             }
-          }
-          
-        } catch (error) {
-          console.warn(`Failed to load ${t}:`, error.message);
-          debugInfo.push({
-            ticker: t,
-            error: error.message
-          });
+            
+            const isRecent = new Date(trade.transactionDate) >= new Date(Date.now() - 3*24*60*60*1000);
+            
+            return `
+                <div class="trade-card">
+                    <div class="metrics-row">
+                        <div class="metric ${buyClass}">
+                            <div class="metric-value ${buyClass}">${trade.shares > 0 ? formatNumber(trade.shares) : 'N/A'}</div>
+                            <div class="metric-label">${isForm144 ? 'Intent' : 'Aktien'}</div>
+                        </div>
+                        <div class="metric ${buyClass}">
+                            <div class="metric-value ${buyClass}">${trade.totalValue > 0 ? formatCurrency(trade.totalValue) : 'N/A'}</div>
+                            <div class="metric-label">Wert</div>
+                        </div>
+                        <div class="metric ${buyClass}">
+                            <div class="metric-value ${buyClass}">${trade.sharesAfter > 0 ? calculateOwnership(trade.sharesAfter) : 'N/A'}</div>
+                            <div class="metric-label">Geschätzt %</div>
+                        </div>
+                    </div>
+                    
+                    <div class="transaction-description ${buyClass}">
+                        ${emoji} ${actionText} ${trade.shares > 0 ? formatNumber(trade.shares) + ' Aktien' : ''} ${trade.price > 0 ? '@ 
+
+        async function loadCompanyFilings() {
+            const ticker = document.getElementById('tickerInput').value.trim().toUpperCase();
+            if (!ticker) {
+                showStatus('Bitte geben Sie einen Ticker ein', 'warning');
+                return;
+            }
+            
+            const content = document.getElementById('content');
+            const searchBtn = document.getElementById('searchBtn');
+            
+            searchBtn.disabled = true;
+            searchBtn.textContent = '🔍 Suche...';
+            
+            content.innerHTML = `
+                <div class="loading">
+                    <div class="spinner"></div>
+                    Lade Form 4 + Form 144 Filings für ` + ticker + ` über Backend API...
+                </div>
+            `;
+            
+            try {
+                showStatus('Lade Insider Trading Daten für ' + ticker + ' (Form 4 + Form 144)...');
+                
+                const result = await fetchInsiderTrades(ticker, false);
+                const trades = result.trades;
+                
+                if (trades.length === 0) {
+                    let debugInfo = '';
+                    if (result.debug) {
+                        const form4Count = result.form4Count || 0;
+                        const includedTypes = (result.includedTypes || []).join(', ');
+                        const debugDetails = JSON.stringify(result.debug, null, 2);
+                        debugInfo = '\\n\\nDebug Info:\\nForm 4 Filings gefunden: ' + form4Count + '\\nIncluded Types: ' + includedTypes + '\\n\\nDetails: ' + debugDetails;
+                    }
+                    
+                    content.innerHTML = 
+                        '<div class="error">' +
+                            'Keine Form 4 oder Form 144 Filings für ' + ticker + ' gefunden.' +
+                            '<br><br>' +
+                            '<small><strong>Was das bedeutet:</strong><br>' +
+                            '• Keine aktuellen Insider Trading Aktivitäten<br>' +
+                            '• Keine Form 4 (Transaktionen) oder Form 144 (Verkaufsankündigungen)<br>' +
+                            '• Möglicherweise verwendet ' + ticker + ' andere Filing-Typen<br><br>' +
+                            '<strong>Versuche andere Ticker:</strong> BTBT, AMD, CRM haben oft Aktivität' + debugInfo + '</small>' +
+                        '</div>';
+                    showStatus('Keine Insider Filings für ' + ticker + ' gefunden', 'warning');
+                    return;
+                }
+                
+                // Sortiere nach Datum (neueste zuerst)
+                trades.sort((a, b) => new Date(b.transactionDate) - new Date(a.transactionDate));
+                
+                currentFilings = trades;
+                content.innerHTML = trades.map(trade => renderTradeCard(trade)).join('');
+                
+                const form4Count = trades.filter(t => !t.isForm144).length;
+                const form144Count = trades.filter(t => t.isForm144).length;
+                
+                showStatus(trades.length + ' Insider Aktivitäten für ' + ticker + ' geladen (' + form4Count + ' Form 4, ' + form144Count + ' Form 144)', 'success');
+                
+            } catch (error) {
+                content.innerHTML = 
+                    '<div class="error">' +
+                        '<strong>Fehler beim Laden der Daten:</strong><br>' +
+                        error.message +
+                        '<br><br>' +
+                        '<small><strong>Mögliche Ursachen:</strong><br>' +
+                        '• Backend Service nicht erreichbar<br>' +
+                        '• Falsche BACKEND_API_URL konfiguriert<br>' +
+                        '• Ticker nicht gefunden<br>' +
+                        '• SEC API temporär nicht verfügbar<br><br>' +
+                        '<strong>Konfiguration prüfen:</strong><br>' +
+                        'Aktuelle Backend URL: <code>' + BACKEND_API_URL + '</code></small>' +
+                    '</div>';
+                showStatus('Fehler: ' + error.message, 'warning');
+            } finally {
+                searchBtn.disabled = false;
+                searchBtn.textContent = '🔍 Suchen';
+            }
         }
-      }
-      
-      // Sortiere nach Datum (neueste zuerst)
-      allTrades.sort((a, b) => new Date(b.transactionDate) - new Date(a.transactionDate));
-      
-      return res.json({
-        success: true,
-        count: allTrades.length,
-        trades: allTrades.slice(0, parseInt(limit)),
-        source: 'SEC EDGAR API (Form 4 + Form 144)',
-        debug: debug === 'true' ? debugInfo : undefined,
-        includedTypes: includeForm144 === 'true' ? ['Form 4', 'Form 144'] : ['Form 4']
-      });
-    }
-    
-    if (!ticker) {
-      return res.status(400).json({ 
-        error: 'Ticker parameter required',
-        example: '/api/insider-trades?ticker=NVDA&includeForm144=true',
-        supportedTickers: Object.keys(COMPANY_CIKS)
-      });
-    }
-    
-    // Spezifischer Ticker
-    const cik = await getCIKFromTicker(ticker);
-    if (!cik) {
-      return res.status(404).json({ 
-        error: `CIK not found for ticker: ${ticker}`,
-        supportedTickers: Object.keys(COMPANY_CIKS)
-      });
-    }
-    
-    const submissions = await fetchCompanySubmissions(cik);
-    
-    // Form 4 Processing
-    const form4Indices = [];
-    submissions.filings.recent.form.forEach((form, index) => {
-      if (form === '4' || form === '4/A') {
-        form4Indices.push(index);
-      }
-    });
-    
-    const allTrades = [];
-    const debugInfo = [];
-    
-    // Process Form 4s
-    if (form4Indices.length > 0) {
-      const maxFilings = Math.min(form4Indices.length, parseInt(limit));
-      
-      for (let i = 0; i < maxFilings; i++) {
-        const idx = form4Indices[i];
-        const accessionNumber = submissions.filings.recent.accessionNumber[idx];
-        const filingDate = submissions.filings.recent.reportDate[idx];
-        
-        try {
-          const result = await fetchForm4XML(accessionNumber, cik);
-          
-          if (result && result.transactions) {
-            allTrades.push(...result.transactions);
-            debugInfo.push({
-              accessionNumber,
-              filingDate,
-              type: 'Form 4',
-              transactionCount: result.transactions.length
-            });
-          }
-        } catch (error) {
-          debugInfo.push({
-            accessionNumber,
-            type: 'Form 4',
-            error: error.message
-          });
+
+        async function loadLatestFilings() {
+            const content = document.getElementById('content');
+            const refreshBtn = document.getElementById('refreshBtn');
+            
+            refreshBtn.disabled = true;
+            refreshBtn.textContent = '🔄 Lädt...';
+            
+            content.innerHTML = 
+                '<div class="loading">' +
+                    '<div class="spinner"></div>' +
+                    'Lade neueste Form 4 + Form 144 Filings über Backend API...' +
+                '</div>';
+            
+            try {
+                showStatus('Lade neueste Insider Trading Aktivitäten (Form 4 + Form 144)...');
+                
+                const result = await fetchInsiderTrades(null, true);
+                const trades = result.trades;
+                
+                if (trades.length === 0) {
+                    content.innerHTML = 
+                        '<div class="error">' +
+                            'Keine aktuellen Form 4 oder Form 144 Filings gefunden.' +
+                            '<br><br>' +
+                            '<small><strong>Das ist normal!</strong><br>' +
+                            'Insider Trading findet nicht täglich statt. Versuchen Sie es mit einem spezifischen Ticker oder prüfen Sie die Backend Service Konfiguration.<br><br>' +
+                            '<strong>Unterstützte Filing-Typen:</strong> ' + (result.includedTypes || ['Form 4']).join(', ') + '</small>' +
+                        '</div>';
+                    showStatus('Keine aktuellen Filings gefunden', 'warning');
+                    return;
+                }
+                
+                // Sortiere nach Datum (neueste zuerst)
+                trades.sort((a, b) => new Date(b.transactionDate) - new Date(a.transactionDate));
+                
+                currentFilings = trades;
+                content.innerHTML = trades.map(trade => renderTradeCard(trade)).join('');
+                
+                const form4Count = trades.filter(t => !t.isForm144).length;
+                const form144Count = trades.filter(t => t.isForm144).length;
+                
+                showStatus(trades.length + ' aktuelle Insider Aktivitäten geladen (' + form4Count + ' Form 4, ' + form144Count + ' Form 144)', 'success');
+                
+            } catch (error) {
+                content.innerHTML = 
+                    '<div class="error">' +
+                        '<strong>Fehler beim Laden der aktuellen Filings:</strong><br>' +
+                        error.message +
+                        '<br><br>' +
+                        '<small><strong>Backend Service Status:</strong><br>' +
+                        'URL: <code>' + BACKEND_API_URL + '</code><br><br>' +
+                        '<strong>Nächste Schritte:</strong><br>' +
+                        '1. Backend Service auf Vercel deployen<br>' +
+                        '2. BACKEND_API_URL im Code aktualisieren<br>' +
+                        '3. Netzwerkverbindung prüfen</small>' +
+                    '</div>';
+                showStatus('Fehler: ' + error.message, 'warning');
+            } finally {
+                refreshBtn.disabled = false;
+                refreshBtn.textContent = '🔄 Neueste Filings laden';
+            }
         }
-      }
-    }
-    
-    // Process Form 144s (falls eingeschaltet)
-    if (includeForm144 === 'true') {
-      const form144Trades = await parseForm144Data(submissions, cik, 5);
-      if (form144Trades.length > 0) {
-        allTrades.push(...form144Trades);
-        debugInfo.push({
-          type: 'Form 144',
-          transactionCount: form144Trades.length
+
+        // Event Listeners
+        document.getElementById('tickerInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                loadCompanyFilings();
+            }
         });
-      }
-    }
-    
-    // Sortiere nach Datum (neueste zuerst)
-    allTrades.sort((a, b) => new Date(b.transactionDate) - new Date(a.transactionDate));
-    
-    res.json({
-      success: true,
-      ticker: ticker.toUpperCase(),
-      cik,
-      count: allTrades.length,
-      trades: allTrades,
-      source: 'SEC EDGAR API',
-      debug: debug === 'true' ? debugInfo : undefined,
-      form4Count: form4Indices.length,
-      includedTypes: includeForm144 === 'true' ? ['Form 4', 'Form 144'] : ['Form 4']
-    });
-    
-  } catch (error) {
-    console.error('API Error:', error);
-    
-    res.status(500).json({ 
-      success: false,
-      error: error.message,
-      details: 'Internal server error',
-      timestamp: new Date().toISOString()
-    });
-  }
-}
+
+        // Auto-load beim Start
+        window.addEventListener('load', function() {
+            const content = document.getElementById('content');
+            content.innerHTML = 
+                '<div class="status success">' +
+                    '<strong>🚀 SEC Insider Trading Feed bereit!</strong><br><br>' +
+                    '<strong>Backend Service:</strong> ' + BACKEND_API_URL + '<br><br>' +
+                    '<strong>Nächste Schritte:</strong><br>' +
+                    '1. Teste mit einem Ticker (z.B. TSLA, AAPL)<br>' +
+                    '2. Oder lade aktuelle Filings von mehreren Unternehmen<br><br>' +
+                    '<small><strong>⚠️ Wichtig:</strong> Stelle sicher, dass dein Backend Service deployed ist!</small>' +
+                '</div>';
+            showStatus('Backend API konfiguriert. Bereit für Live-Daten!', 'success');
+        });
+    </script>
+</body>
+</html> + trade.price.toFixed(2) : ''}
+                        ${isForm144 ? '<br><small style="color: #ffaa00;">⚠️ Form 144 - Intent to Sell Notice</small>' : ''}
+                    </div>
+                    
+                    <div class="company-info">
+                        <div class="company-name">${trade.ticker ? trade.ticker + ' - ' : ''}${trade.companyName}</div>
+                    </div>
+                    
+                    <div class="person-info">
+                        <div class="person-name">${trade.personName}</div>
+                        <div class="person-title">${trade.title}</div>
+                    </div>
+                    
+                    <div class="date-info">
+                        ${trade.sharesAfter > 0 ? 'Besitzt jetzt ' + formatNumber(trade.sharesAfter) + ' Aktien direkt' : 'Aktienbestand nach Transaktion'}
+                        <br>
+                        ${formatDate(trade.transactionDate)} ${isRecent ? '(Kürzlich)' : ''}
+                        ${trade.footnotes ? '<br><small style="color: #888;">' + trade.footnotes + '</small>' : ''}
+                    </div>
+                </div>
+            `;
+        }
+
+        async function loadCompanyFilings() {
+            const ticker = document.getElementById('tickerInput').value.trim().toUpperCase();
+            if (!ticker) {
+                showStatus('Bitte geben Sie einen Ticker ein', 'warning');
+                return;
+            }
+            
+            const content = document.getElementById('content');
+            const searchBtn = document.getElementById('searchBtn');
+            
+            searchBtn.disabled = true;
+            searchBtn.textContent = '🔍 Suche...';
+            
+            content.innerHTML = `
+                <div class="loading">
+                    <div class="spinner"></div>
+                    Lade Form 4 + Form 144 Filings für ${ticker} über Backend API...
+                </div>
+            `;
+            
+            try {
+                showStatus(`Lade Insider Trading Daten für ${ticker} (Form 4 + Form 144)...`);
+                
+                const result = await fetchInsiderTrades(ticker, false);
+                const trades = result.trades;
+                
+                if (trades.length === 0) {
+                    let debugInfo = '';
+                    if (result.debug) {
+                        debugInfo = `\n\nDebug Info:\nForm 4 Filings gefunden: ${result.form4Count || 0}\nIncluded Types: ${(result.includedTypes || []).join(', ')}\n\nDetails: ${JSON.stringify(result.debug, null, 2)}`;
+                    }
+                    
+                    content.innerHTML = `
+                        <div class="error">
+                            Keine Form 4 oder Form 144 Filings für ${ticker} gefunden.
+                            <br><br>
+                            <small><strong>Was das bedeutet:</strong><br>
+                            • Keine aktuellen Insider Trading Aktivitäten<br>
+                            • Keine Form 4 (Transaktionen) oder Form 144 (Verkaufsankündigungen)<br>
+                            • Möglicherweise verwendet ${ticker} andere Filing-Typen<br><br>
+                            <strong>Versuche andere Ticker:</strong> BTBT, AMD, CRM haben oft Aktivität${debugInfo}</small>
+                        </div>
+                    `;
+                    showStatus(`Keine Insider Filings für ${ticker} gefunden`, 'warning');
+                    return;
+                }
+                
+                // Sortiere nach Datum (neueste zuerst)
+                trades.sort((a, b) => new Date(b.transactionDate) - new Date(a.transactionDate));
+                
+                currentFilings = trades;
+                content.innerHTML = trades.map(trade => renderTradeCard(trade)).join('');
+                
+                const form4Count = trades.filter(t => !t.isForm144).length;
+                const form144Count = trades.filter(t => t.isForm144).length;
+                
+                showStatus(`${trades.length} Insider Aktivitäten für ${ticker} geladen (${form4Count} Form 4, ${form144Count} Form 144)`, 'success');
+                
+            } catch (error) {
+                content.innerHTML = `
+                    <div class="error">
+                        <strong>Fehler beim Laden der Daten:</strong><br>
+                        ${error.message}
+                        <br><br>
+                        <small><strong>Mögliche Ursachen:</strong><br>
+                        • Backend Service nicht erreichbar<br>
+                        • Falsche BACKEND_API_URL konfiguriert<br>
+                        • Ticker nicht gefunden<br>
+                        • SEC API temporär nicht verfügbar<br><br>
+                        <strong>Konfiguration prüfen:</strong><br>
+                        Aktuelle Backend URL: <code>${BACKEND_API_URL}</code></small>
+                    </div>
+                `;
+                showStatus(`Fehler: ${error.message}`, 'warning');
+            } finally {
+                searchBtn.disabled = false;
+                searchBtn.textContent = '🔍 Suchen';
+            }
+        }
+
+        async function loadLatestFilings() {
+            const content = document.getElementById('content');
+            const refreshBtn = document.getElementById('refreshBtn');
+            
+            refreshBtn.disabled = true;
+            refreshBtn.textContent = '🔄 Lädt...';
+            
+            content.innerHTML = `
+                <div class="loading">
+                    <div class="spinner"></div>
+                    Lade neueste Form 4 + Form 144 Filings über Backend API...
+                </div>
+            `;
+            
+            try {
+                showStatus('Lade neueste Insider Trading Aktivitäten (Form 4 + Form 144)...');
+                
+                const result = await fetchInsiderTrades(null, true);
+                const trades = result.trades;
+                
+                if (trades.length === 0) {
+                    content.innerHTML = `
+                        <div class="error">
+                            Keine aktuellen Form 4 oder Form 144 Filings gefunden.
+                            <br><br>
+                            <small><strong>Das ist normal!</strong><br>
+                            Insider Trading findet nicht täglich statt. Versuchen Sie es mit einem spezifischen Ticker oder prüfen Sie die Backend Service Konfiguration.<br><br>
+                            <strong>Unterstützte Filing-Typen:</strong> ${(result.includedTypes || ['Form 4']).join(', ')}</small>
+                        </div>
+                    `;
+                    showStatus('Keine aktuellen Filings gefunden', 'warning');
+                    return;
+                }
+                
+                // Sortiere nach Datum (neueste zuerst)
+                trades.sort((a, b) => new Date(b.transactionDate) - new Date(a.transactionDate));
+                
+                currentFilings = trades;
+                content.innerHTML = trades.map(trade => renderTradeCard(trade)).join('');
+                
+                const form4Count = trades.filter(t => !t.isForm144).length;
+                const form144Count = trades.filter(t => t.isForm144).length;
+                
+                showStatus(`${trades.length} aktuelle Insider Aktivitäten geladen (${form4Count} Form 4, ${form144Count} Form 144)`, 'success');
+                
+            } catch (error) {
+                content.innerHTML = `
+                    <div class="error">
+                        <strong>Fehler beim Laden der aktuellen Filings:</strong><br>
+                        ${error.message}
+                        <br><br>
+                        <small><strong>Backend Service Status:</strong><br>
+                        URL: <code>${BACKEND_API_URL}</code><br><br>
+                        <strong>Nächste Schritte:</strong><br>
+                        1. Backend Service auf Vercel deployen<br>
+                        2. BACKEND_API_URL im Code aktualisieren<br>
+                        3. Netzwerkverbindung prüfen</small>
+                    </div>
+                `;
+                showStatus(`Fehler: ${error.message}`, 'warning');
+            } finally {
+                refreshBtn.disabled = false;
+                refreshBtn.textContent = '🔄 Neueste Filings laden';
+            }
+        }
+
+        // Event Listeners
+        document.getElementById('tickerInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                loadCompanyFilings();
+            }
+        });
+
+        // Auto-load beim Start
+        window.addEventListener('load', function() {
+            const content = document.getElementById('content');
+            content.innerHTML = `
+                <div class="status success">
+                    <strong>🚀 SEC Insider Trading Feed bereit!</strong><br><br>
+                    <strong>Backend Service:</strong> ${BACKEND_API_URL}<br><br>
+                    <strong>Nächste Schritte:</strong><br>
+                    1. Teste mit einem Ticker (z.B. TSLA, AAPL)<br>
+                    2. Oder lade aktuelle Filings von mehreren Unternehmen<br><br>
+                    <small><strong>⚠️ Wichtig:</strong> Stelle sicher, dass dein Backend Service deployed ist!</small>
+                </div>
+            `;
+            showStatus('Backend API konfiguriert. Bereit für Live-Daten!', 'success');
+        });
+    </script>
+</body>
+</html>
