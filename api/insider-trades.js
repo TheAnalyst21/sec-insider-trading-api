@@ -300,7 +300,7 @@
     <div class="container">
         <div class="header">
             <h1>📈 Live Insider Trading Feed</h1>
-            <p>Echte SEC Form 4 Filings</p>
+            <p>Echte SEC Form 4 + Form 144 Filings</p>
         </div>
 
         <div class="controls">
@@ -327,15 +327,14 @@
         // Backend API Configuration
         // 🔥 WICHTIG: Ersetze diese URL mit deiner echten Vercel URL
         const BACKEND_API_URL = 'https://DEINE-VERCEL-URL.vercel.app/api/insider-trades';
-        // Beispiel: 'https://sec-insider-trading-api-xyz123.vercel.app/api/insider-trades'
         
         let currentFilings = [];
 
-        function showStatus(message, type = 'info') {
+        function showStatus(message, type) {
             const status = document.getElementById('status');
             const className = type === 'success' ? 'status success' : 
                              type === 'warning' ? 'status warning' : 'status';
-            status.innerHTML = `<div class="${className}">${message}</div>`;
+            status.innerHTML = '<div class="' + className + '">' + message + '</div>';
         }
 
         function formatNumber(num) {
@@ -367,29 +366,105 @@
             } else if (diffDays === 2) {
                 return 'Gestern';
             } else if (diffDays <= 7) {
-                return `vor ${diffDays-1} Tagen`;
+                return 'vor ' + (diffDays-1) + ' Tagen';
             }
             
             return date.toLocaleDateString('de-DE');
         }
 
-        async function fetchInsiderTrades(ticker = null, latest = false) {
+        function calculateOwnership(sharesAfter, totalShares) {
+            totalShares = totalShares || 10000000;
+            return ((sharesAfter / totalShares) * 100).toFixed(1) + '%';
+        }
+
+        function renderTradeCard(trade) {
+            const isBuy = trade.transactionType === 'A';
+            const isForm144 = trade.isForm144 || trade.transactionCode === '144';
+            
+            let buyClass, actionText, emoji;
+            
+            if (isForm144) {
+                buyClass = 'sell';
+                actionText = 'VERKAUFS-ANKÜNDIGUNG';
+                emoji = '🔔';
+            } else {
+                buyClass = isBuy ? 'buy' : 'sell';
+                actionText = isBuy ? 'GEKAUFT' : 'VERKAUFT';
+                emoji = isBuy ? '🟢' : '🔴';
+            }
+            
+            const isRecent = new Date(trade.transactionDate) >= new Date(Date.now() - 3*24*60*60*1000);
+            const sharesDisplay = trade.shares > 0 ? formatNumber(trade.shares) : 'N/A';
+            const valueDisplay = trade.totalValue > 0 ? formatCurrency(trade.totalValue) : 'N/A';
+            const ownershipDisplay = trade.sharesAfter > 0 ? calculateOwnership(trade.sharesAfter) : 'N/A';
+            const priceDisplay = trade.price > 0 ? '@ $' + trade.price.toFixed(2) : '';
+            const recentText = isRecent ? '(Kürzlich)' : '';
+            const sharesText = trade.shares > 0 ? formatNumber(trade.shares) + ' Aktien' : '';
+            const tickerDisplay = trade.ticker ? trade.ticker + ' - ' : '';
+            const sharesAfterText = trade.sharesAfter > 0 ? 'Besitzt jetzt ' + formatNumber(trade.sharesAfter) + ' Aktien direkt' : 'Aktienbestand nach Transaktion';
+            
+            let form144Warning = '';
+            if (isForm144) {
+                form144Warning = '<br><small style="color: #ffaa00;">⚠️ Form 144 - Intent to Sell Notice</small>';
+            }
+            
+            let footnoteDisplay = '';
+            if (trade.footnotes) {
+                footnoteDisplay = '<br><small style="color: #888;">' + trade.footnotes + '</small>';
+            }
+            
+            return '<div class="trade-card">' +
+                '<div class="metrics-row">' +
+                    '<div class="metric ' + buyClass + '">' +
+                        '<div class="metric-value ' + buyClass + '">' + sharesDisplay + '</div>' +
+                        '<div class="metric-label">' + (isForm144 ? 'Intent' : 'Aktien') + '</div>' +
+                    '</div>' +
+                    '<div class="metric ' + buyClass + '">' +
+                        '<div class="metric-value ' + buyClass + '">' + valueDisplay + '</div>' +
+                        '<div class="metric-label">Wert</div>' +
+                    '</div>' +
+                    '<div class="metric ' + buyClass + '">' +
+                        '<div class="metric-value ' + buyClass + '">' + ownershipDisplay + '</div>' +
+                        '<div class="metric-label">Geschätzt %</div>' +
+                    '</div>' +
+                '</div>' +
+                '<div class="transaction-description ' + buyClass + '">' +
+                    emoji + ' ' + actionText + ' ' + sharesText + ' ' + priceDisplay +
+                    form144Warning +
+                '</div>' +
+                '<div class="company-info">' +
+                    '<div class="company-name">' + tickerDisplay + trade.companyName + '</div>' +
+                '</div>' +
+                '<div class="person-info">' +
+                    '<div class="person-name">' + trade.personName + '</div>' +
+                    '<div class="person-title">' + trade.title + '</div>' +
+                '</div>' +
+                '<div class="date-info">' +
+                    sharesAfterText +
+                    '<br>' +
+                    formatDate(trade.transactionDate) + ' ' + recentText +
+                    footnoteDisplay +
+                '</div>' +
+            '</div>';
+        }
+
+        async function fetchInsiderTrades(ticker, latest) {
             const params = new URLSearchParams();
             
             if (latest) {
                 params.append('latest', 'true');
                 params.append('limit', '20');
-                params.append('includeForm144', 'true'); // NEW: Form 144 Support
+                params.append('includeForm144', 'true');
             } else if (ticker) {
                 params.append('ticker', ticker.toUpperCase());
                 params.append('limit', '15');
-                params.append('includeForm144', 'true'); // NEW: Form 144 Support
-                params.append('debug', 'true'); // NEW: Debug für Ticker-Suchen
+                params.append('includeForm144', 'true');
+                params.append('debug', 'true');
             } else {
                 throw new Error('Either ticker or latest=true must be specified');
             }
             
-            const url = `${BACKEND_API_URL}?${params}`;
+            const url = BACKEND_API_URL + '?' + params.toString();
             
             try {
                 const response = await fetch(url, {
@@ -402,7 +477,7 @@
                 
                 if (!response.ok) {
                     const errorData = await response.json().catch(() => ({}));
-                    throw new Error(errorData.error || `HTTP ${response.status}: ${response.statusText}`);
+                    throw new Error(errorData.error || 'HTTP ' + response.status + ': ' + response.statusText);
                 }
                 
                 const data = await response.json();
@@ -426,58 +501,6 @@
             }
         }
 
-        function getTransactionDescription(trade) {
-            const isBuy = trade.transactionType === 'A';
-            const action = isBuy ? 'GEKAUFT' : 'VERKAUFT';
-            const shares = formatNumber(trade.shares);
-            const price = `${trade.price.toFixed(2)}`;
-            const emoji = isBuy ? '🟢' : '🔴';
-            
-            return `${emoji} ${action} ${shares} Aktien @ ${price}`;
-        }
-
-        function calculateOwnership(sharesAfter, totalShares = 10000000) {
-            return ((sharesAfter / totalShares) * 100).toFixed(1) + '%';
-        }
-
-        function renderTradeCard(trade) {
-            const isBuy = trade.transactionType === 'A';
-            const isForm144 = trade.isForm144 || trade.transactionCode === '144';
-            
-            let buyClass, actionText, emoji;
-            
-            if (isForm144) {
-                buyClass = 'sell';
-                actionText = 'VERKAUFS-ANKÜNDIGUNG';
-                emoji = '🔔';
-            } else {
-                buyClass = isBuy ? 'buy' : 'sell';
-                actionText = isBuy ? 'GEKAUFT' : 'VERKAUFT';
-                emoji = isBuy ? '🟢' : '🔴';
-            }
-            
-            const isRecent = new Date(trade.transactionDate) >= new Date(Date.now() - 3*24*60*60*1000);
-            
-            return `
-                <div class="trade-card">
-                    <div class="metrics-row">
-                        <div class="metric ${buyClass}">
-                            <div class="metric-value ${buyClass}">${trade.shares > 0 ? formatNumber(trade.shares) : 'N/A'}</div>
-                            <div class="metric-label">${isForm144 ? 'Intent' : 'Aktien'}</div>
-                        </div>
-                        <div class="metric ${buyClass}">
-                            <div class="metric-value ${buyClass}">${trade.totalValue > 0 ? formatCurrency(trade.totalValue) : 'N/A'}</div>
-                            <div class="metric-label">Wert</div>
-                        </div>
-                        <div class="metric ${buyClass}">
-                            <div class="metric-value ${buyClass}">${trade.sharesAfter > 0 ? calculateOwnership(trade.sharesAfter) : 'N/A'}</div>
-                            <div class="metric-label">Geschätzt %</div>
-                        </div>
-                    </div>
-                    
-                    <div class="transaction-description ${buyClass}">
-                        ${emoji} ${actionText} ${trade.shares > 0 ? formatNumber(trade.shares) + ' Aktien' : ''} ${trade.price > 0 ? '@ 
-
         async function loadCompanyFilings() {
             const ticker = document.getElementById('tickerInput').value.trim().toUpperCase();
             if (!ticker) {
@@ -491,12 +514,11 @@
             searchBtn.disabled = true;
             searchBtn.textContent = '🔍 Suche...';
             
-            content.innerHTML = `
-                <div class="loading">
-                    <div class="spinner"></div>
-                    Lade Form 4 + Form 144 Filings für ` + ticker + ` über Backend API...
-                </div>
-            `;
+            content.innerHTML = 
+                '<div class="loading">' +
+                    '<div class="spinner"></div>' +
+                    'Lade Form 4 + Form 144 Filings für ' + ticker + ' über Backend API...' +
+                '</div>';
             
             try {
                 showStatus('Lade Insider Trading Daten für ' + ticker + ' (Form 4 + Form 144)...');
@@ -641,199 +663,6 @@
                     '2. Oder lade aktuelle Filings von mehreren Unternehmen<br><br>' +
                     '<small><strong>⚠️ Wichtig:</strong> Stelle sicher, dass dein Backend Service deployed ist!</small>' +
                 '</div>';
-            showStatus('Backend API konfiguriert. Bereit für Live-Daten!', 'success');
-        });
-    </script>
-</body>
-</html> + trade.price.toFixed(2) : ''}
-                        ${isForm144 ? '<br><small style="color: #ffaa00;">⚠️ Form 144 - Intent to Sell Notice</small>' : ''}
-                    </div>
-                    
-                    <div class="company-info">
-                        <div class="company-name">${trade.ticker ? trade.ticker + ' - ' : ''}${trade.companyName}</div>
-                    </div>
-                    
-                    <div class="person-info">
-                        <div class="person-name">${trade.personName}</div>
-                        <div class="person-title">${trade.title}</div>
-                    </div>
-                    
-                    <div class="date-info">
-                        ${trade.sharesAfter > 0 ? 'Besitzt jetzt ' + formatNumber(trade.sharesAfter) + ' Aktien direkt' : 'Aktienbestand nach Transaktion'}
-                        <br>
-                        ${formatDate(trade.transactionDate)} ${isRecent ? '(Kürzlich)' : ''}
-                        ${trade.footnotes ? '<br><small style="color: #888;">' + trade.footnotes + '</small>' : ''}
-                    </div>
-                </div>
-            `;
-        }
-
-        async function loadCompanyFilings() {
-            const ticker = document.getElementById('tickerInput').value.trim().toUpperCase();
-            if (!ticker) {
-                showStatus('Bitte geben Sie einen Ticker ein', 'warning');
-                return;
-            }
-            
-            const content = document.getElementById('content');
-            const searchBtn = document.getElementById('searchBtn');
-            
-            searchBtn.disabled = true;
-            searchBtn.textContent = '🔍 Suche...';
-            
-            content.innerHTML = `
-                <div class="loading">
-                    <div class="spinner"></div>
-                    Lade Form 4 + Form 144 Filings für ${ticker} über Backend API...
-                </div>
-            `;
-            
-            try {
-                showStatus(`Lade Insider Trading Daten für ${ticker} (Form 4 + Form 144)...`);
-                
-                const result = await fetchInsiderTrades(ticker, false);
-                const trades = result.trades;
-                
-                if (trades.length === 0) {
-                    let debugInfo = '';
-                    if (result.debug) {
-                        debugInfo = `\n\nDebug Info:\nForm 4 Filings gefunden: ${result.form4Count || 0}\nIncluded Types: ${(result.includedTypes || []).join(', ')}\n\nDetails: ${JSON.stringify(result.debug, null, 2)}`;
-                    }
-                    
-                    content.innerHTML = `
-                        <div class="error">
-                            Keine Form 4 oder Form 144 Filings für ${ticker} gefunden.
-                            <br><br>
-                            <small><strong>Was das bedeutet:</strong><br>
-                            • Keine aktuellen Insider Trading Aktivitäten<br>
-                            • Keine Form 4 (Transaktionen) oder Form 144 (Verkaufsankündigungen)<br>
-                            • Möglicherweise verwendet ${ticker} andere Filing-Typen<br><br>
-                            <strong>Versuche andere Ticker:</strong> BTBT, AMD, CRM haben oft Aktivität${debugInfo}</small>
-                        </div>
-                    `;
-                    showStatus(`Keine Insider Filings für ${ticker} gefunden`, 'warning');
-                    return;
-                }
-                
-                // Sortiere nach Datum (neueste zuerst)
-                trades.sort((a, b) => new Date(b.transactionDate) - new Date(a.transactionDate));
-                
-                currentFilings = trades;
-                content.innerHTML = trades.map(trade => renderTradeCard(trade)).join('');
-                
-                const form4Count = trades.filter(t => !t.isForm144).length;
-                const form144Count = trades.filter(t => t.isForm144).length;
-                
-                showStatus(`${trades.length} Insider Aktivitäten für ${ticker} geladen (${form4Count} Form 4, ${form144Count} Form 144)`, 'success');
-                
-            } catch (error) {
-                content.innerHTML = `
-                    <div class="error">
-                        <strong>Fehler beim Laden der Daten:</strong><br>
-                        ${error.message}
-                        <br><br>
-                        <small><strong>Mögliche Ursachen:</strong><br>
-                        • Backend Service nicht erreichbar<br>
-                        • Falsche BACKEND_API_URL konfiguriert<br>
-                        • Ticker nicht gefunden<br>
-                        • SEC API temporär nicht verfügbar<br><br>
-                        <strong>Konfiguration prüfen:</strong><br>
-                        Aktuelle Backend URL: <code>${BACKEND_API_URL}</code></small>
-                    </div>
-                `;
-                showStatus(`Fehler: ${error.message}`, 'warning');
-            } finally {
-                searchBtn.disabled = false;
-                searchBtn.textContent = '🔍 Suchen';
-            }
-        }
-
-        async function loadLatestFilings() {
-            const content = document.getElementById('content');
-            const refreshBtn = document.getElementById('refreshBtn');
-            
-            refreshBtn.disabled = true;
-            refreshBtn.textContent = '🔄 Lädt...';
-            
-            content.innerHTML = `
-                <div class="loading">
-                    <div class="spinner"></div>
-                    Lade neueste Form 4 + Form 144 Filings über Backend API...
-                </div>
-            `;
-            
-            try {
-                showStatus('Lade neueste Insider Trading Aktivitäten (Form 4 + Form 144)...');
-                
-                const result = await fetchInsiderTrades(null, true);
-                const trades = result.trades;
-                
-                if (trades.length === 0) {
-                    content.innerHTML = `
-                        <div class="error">
-                            Keine aktuellen Form 4 oder Form 144 Filings gefunden.
-                            <br><br>
-                            <small><strong>Das ist normal!</strong><br>
-                            Insider Trading findet nicht täglich statt. Versuchen Sie es mit einem spezifischen Ticker oder prüfen Sie die Backend Service Konfiguration.<br><br>
-                            <strong>Unterstützte Filing-Typen:</strong> ${(result.includedTypes || ['Form 4']).join(', ')}</small>
-                        </div>
-                    `;
-                    showStatus('Keine aktuellen Filings gefunden', 'warning');
-                    return;
-                }
-                
-                // Sortiere nach Datum (neueste zuerst)
-                trades.sort((a, b) => new Date(b.transactionDate) - new Date(a.transactionDate));
-                
-                currentFilings = trades;
-                content.innerHTML = trades.map(trade => renderTradeCard(trade)).join('');
-                
-                const form4Count = trades.filter(t => !t.isForm144).length;
-                const form144Count = trades.filter(t => t.isForm144).length;
-                
-                showStatus(`${trades.length} aktuelle Insider Aktivitäten geladen (${form4Count} Form 4, ${form144Count} Form 144)`, 'success');
-                
-            } catch (error) {
-                content.innerHTML = `
-                    <div class="error">
-                        <strong>Fehler beim Laden der aktuellen Filings:</strong><br>
-                        ${error.message}
-                        <br><br>
-                        <small><strong>Backend Service Status:</strong><br>
-                        URL: <code>${BACKEND_API_URL}</code><br><br>
-                        <strong>Nächste Schritte:</strong><br>
-                        1. Backend Service auf Vercel deployen<br>
-                        2. BACKEND_API_URL im Code aktualisieren<br>
-                        3. Netzwerkverbindung prüfen</small>
-                    </div>
-                `;
-                showStatus(`Fehler: ${error.message}`, 'warning');
-            } finally {
-                refreshBtn.disabled = false;
-                refreshBtn.textContent = '🔄 Neueste Filings laden';
-            }
-        }
-
-        // Event Listeners
-        document.getElementById('tickerInput').addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
-                loadCompanyFilings();
-            }
-        });
-
-        // Auto-load beim Start
-        window.addEventListener('load', function() {
-            const content = document.getElementById('content');
-            content.innerHTML = `
-                <div class="status success">
-                    <strong>🚀 SEC Insider Trading Feed bereit!</strong><br><br>
-                    <strong>Backend Service:</strong> ${BACKEND_API_URL}<br><br>
-                    <strong>Nächste Schritte:</strong><br>
-                    1. Teste mit einem Ticker (z.B. TSLA, AAPL)<br>
-                    2. Oder lade aktuelle Filings von mehreren Unternehmen<br><br>
-                    <small><strong>⚠️ Wichtig:</strong> Stelle sicher, dass dein Backend Service deployed ist!</small>
-                </div>
-            `;
             showStatus('Backend API konfiguriert. Bereit für Live-Daten!', 'success');
         });
     </script>
