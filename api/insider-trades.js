@@ -1,4 +1,4 @@
-// api/insider-trades.js - EINFACHE STABILE VERSION
+// api/insider-trades.js - 100% ECHTE SEC DATEN
 export default async function handler(req, res) {
   // CORS Headers
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -20,7 +20,10 @@ export default async function handler(req, res) {
     'MSFT': '0000789019',
     'NVDA': '0001045810',
     'BTBT': '0001710350',
-    'AMD': '0000002488'
+    'AMD': '0000002488',
+    'META': '0001326801',
+    'GOOGL': '0001652044',
+    'AMZN': '0001018724'
   };
 
   async function fetchWithRetry(url, retries = 2) {
@@ -29,12 +32,12 @@ export default async function handler(req, res) {
         const response = await fetch(url, {
           headers: {
             'User-Agent': 'SEC-API contact@yoursite.com',
-            'Accept': 'application/json'
+            'Accept': 'application/json, text/xml, */*'
           }
         });
         
         if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
         
         return response;
@@ -45,52 +48,207 @@ export default async function handler(req, res) {
     }
   }
 
+  // ECHTES XML PARSING - Robuste Version
+  function parseForm4XML(xmlText) {
+    try {
+      // Suche nach wichtigen Daten mit Regex (robuster als XML Parser)
+      const extractValue = (pattern, text) => {
+        const match = text.match(pattern);
+        return match ? match[1].trim() : null;
+      };
+      
+      // Person Info extrahieren
+      const personName = extractValue(/<rptOwnerName[^>]*>([^<]+)<\/rptOwnerName>/, xmlText) ||
+                        extractValue(/<reportingOwnerId[^>]*>[\s\S]*?<rptOwnerName[^>]*>([^<]+)<\/rptOwnerName>/, xmlText) ||
+                        'Unknown Insider';
+      
+      // Title extrahieren
+      let title = 'Insider';
+      if (xmlText.includes('<isDirector>1</isDirector>')) {
+        title = 'Director';
+      }
+      if (xmlText.includes('<isOfficer>1</isOfficer>')) {
+        const officerTitle = extractValue(/<officerTitle[^>]*>([^<]+)<\/officerTitle>/, xmlText);
+        if (officerTitle) title = officerTitle;
+      }
+      if (xmlText.includes('<isTenPercentOwner>1</isTenPercentOwner>')) {
+        title = title === 'Insider' ? '10% Owner' : title + ', 10% Owner';
+      }
+      
+      // Company Info
+      const companyName = extractValue(/<issuerName[^>]*>([^<]+)<\/issuerName>/, xmlText) || 'Unknown Company';
+      const ticker = extractValue(/<issuerTradingSymbol[^>]*>([^<]+)<\/issuerTradingSymbol>/, xmlText) || '';
+      
+      // Datum
+      const filingDate = extractValue(/<documentDate[^>]*>([^<]+)<\/documentDate>/, xmlText) || 
+                        extractValue(/<periodOfReport[^>]*>([^<]+)<\/periodOfReport>/, xmlText) || 
+                        new Date().toISOString().split('T')[0];
+      
+      // Transaktionen extrahieren
+      const transactions = [];
+      
+      // Suche nach nonDerivativeTransaction Blöcken
+      const transactionPattern = /<nonDerivativeTransaction[^>]*>([\s\S]*?)<\/nonDerivativeTransaction>/g;
+      let transactionMatch;
+      
+      while ((transactionMatch = transactionPattern.exec(xmlText)) !== null) {
+        const transactionXML = transactionMatch[1];
+        
+        try {
+          // Extrahiere Transaktionsdetails
+          const transactionDate = extractValue(/<transactionDate[^>]*>[\s\S]*?<value[^>]*>([^<]+)<\/value>/, transactionXML) ||
+                                 extractValue(/<transactionDate[^>]*>([^<]+)<\/transactionDate>/, transactionXML) ||
+                                 filingDate;
+          
+          const transactionCode = extractValue(/<transactionCode[^>]*>([^<]+)<\/transactionCode>/, transactionXML) ||
+                                 extractValue(/<code[^>]*>([^<]+)<\/code>/, transactionXML) || 'P';
+          
+          // Aktienanzahl
+          const sharesStr = extractValue(/<transactionShares[^>]*>[\s\S]*?<value[^>]*>([^<]+)<\/value>/, transactionXML) ||
+                           extractValue(/<transactionShares[^>]*>([^<]+)<\/transactionShares>/, transactionXML);
+          const shares = sharesStr ? parseFloat(sharesStr.replace(/,/g, '')) : 0;
+          
+          // Preis
+          const priceStr = extractValue(/<transactionPricePerShare[^>]*>[\s\S]*?<value[^>]*>([^<]+)<\/value>/, transactionXML) ||
+                          extractValue(/<transactionPricePerShare[^>]*>([^<]+)<\/transactionPricePerShare>/, transactionXML);
+          const price = priceStr ? parseFloat(priceStr.replace(/,/g, '')) : 0;
+          
+          // Acquired/Disposed Code
+          const acquiredDisposed = extractValue(/<transactionAcquiredDisposedCode[^>]*>[\s\S]*?<value[^>]*>([^<]+)<\/value>/, transactionXML) ||
+                                  extractValue(/<transactionAcquiredDisposedCode[^>]*>([^<]+)<\/transactionAcquiredDisposedCode>/, transactionXML) || 'A';
+          
+          // Shares After Transaction
+          const sharesAfterStr = extractValue(/<sharesOwnedFollowingTransaction[^>]*>[\s\S]*?<value[^>]*>([^<]+)<\/value>/, transactionXML) ||
+                                extractValue(/<sharesOwnedFollowingTransaction[^>]*>([^<]+)<\/sharesOwnedFollowingTransaction>/, transactionXML);
+          const sharesAfter = sharesAfterStr ? parseFloat(sharesAfterStr.replace(/,/g, '')) : 0;
+          
+          // Security Title
+          const securityTitle = extractValue(/<securityTitle[^>]*>[\s\S]*?<value[^>]*>([^<]+)<\/value>/, transactionXML) ||
+                               extractValue(/<securityTitle[^>]*>([^<]+)<\/securityTitle>/, transactionXML) || 'Common Stock';
+          
+          // Nur valide Transaktionen hinzufügen
+          if (shares > 0 && price >= 0) {
+            transactions.push({
+              personName,
+              title,
+              companyName,
+              ticker,
+              shares: Math.round(shares),
+              price: Math.round(price * 100) / 100, // 2 Dezimalstellen
+              totalValue: Math.round(shares * price),
+              sharesAfter: Math.round(sharesAfter),
+              transactionDate,
+              filingDate,
+              transactionType: acquiredDisposed, // A = Acquired, D = Disposed
+              transactionCode, // P = Purchase, S = Sale, etc.
+              securityTitle,
+              ownershipForm: 'D',
+              footnotes: null
+            });
+          }
+        } catch (parseError) {
+          console.warn('Error parsing individual transaction:', parseError.message);
+          // Fahre mit nächster Transaktion fort
+        }
+      }
+      
+      return {
+        success: true,
+        transactions,
+        debug: {
+          personName,
+          title,
+          companyName,
+          ticker,
+          filingDate,
+          transactionCount: transactions.length,
+          xmlLength: xmlText.length
+        }
+      };
+      
+    } catch (error) {
+      console.error('XML parsing error:', error.message);
+      return {
+        success: false,
+        error: error.message,
+        transactions: []
+      };
+    }
+  }
+
   try {
-    const { ticker, latest, limit = 10 } = req.query;
+    const { ticker, latest, limit = 10, debug = false } = req.query;
     
     if (latest === 'true') {
-      // Einfache Demo-Daten für "latest"
-      const demoTrades = [
-        {
-          personName: "Samir Tabar",
-          title: "Chief Executive Officer", 
-          companyName: "Bit Digital, Inc",
-          ticker: "BTBT",
-          shares: 750000,
-          price: 2.00,
-          totalValue: 1500000,
-          sharesAfter: 2108089,
-          transactionDate: "2025-06-25",
-          filingDate: "2025-06-26",
-          transactionType: "A",
-          transactionCode: "P",
-          ownershipForm: "D",
-          footnotes: "Purchase in underwritten public offering"
-        },
-        {
-          personName: "Brock Pierce",
-          title: "Director",
-          companyName: "Bit Digital, Inc", 
-          ticker: "BTBT",
-          shares: 500000,
-          price: 2.00,
-          totalValue: 1000000,
-          sharesAfter: 580000,
-          transactionDate: "2025-06-27",
-          filingDate: "2025-06-27",
-          transactionType: "A",
-          transactionCode: "P",
-          ownershipForm: "D",
-          footnotes: "Purchase in underwritten public offering"
+      // Lade echte Daten für mehrere Unternehmen
+      const activeCompanies = ['BTBT', 'NVDA', 'AMD', 'CRM'];
+      const allTrades = [];
+      const debugInfo = [];
+      
+      for (const t of activeCompanies) {
+        try {
+          const cik = COMPANY_CIKS[t];
+          if (!cik) continue;
+          
+          // Submissions laden
+          const submissionsUrl = `https://data.sec.gov/submissions/CIK${cik}.json`;
+          const submissionsResponse = await fetchWithRetry(submissionsUrl);
+          const submissionsData = await submissionsResponse.json();
+          
+          // Form 4 Filings finden
+          const form4Indices = [];
+          submissionsData.filings.recent.form.forEach((form, index) => {
+            if (form === '4' || form === '4/A') {
+              form4Indices.push(index);
+            }
+          });
+          
+          if (form4Indices.length > 0) {
+            // Lade die neuesten 2 Form 4 XMLs
+            const maxToLoad = Math.min(form4Indices.length, 2);
+            
+            for (let i = 0; i < maxToLoad; i++) {
+              const idx = form4Indices[i];
+              const accessionNumber = submissionsData.filings.recent.accessionNumber[idx];
+              
+              try {
+                // XML URL konstruieren
+                const cleanAccession = accessionNumber.replace(/-/g, '');
+                const xmlUrl = `https://www.sec.gov/Archives/edgar/data/${parseInt(cik)}/${cleanAccession}/ownership.xml`;
+                
+                // XML laden und parsen
+                const xmlResponse = await fetchWithRetry(xmlUrl);
+                const xmlText = await xmlResponse.text();
+                const parseResult = parseForm4XML(xmlText);
+                
+                if (parseResult.success && parseResult.transactions.length > 0) {
+                  allTrades.push(...parseResult.transactions);
+                  debugInfo.push({
+                    ticker: t,
+                    accessionNumber,
+                    transactionCount: parseResult.transactions.length,
+                    personName: parseResult.debug.personName
+                  });
+                }
+              } catch (xmlError) {
+                console.warn(`XML fetch failed for ${t}:`, xmlError.message);
+              }
+            }
+          }
+        } catch (error) {
+          console.warn(`Failed to load ${t}:`, error.message);
         }
-      ];
+      }
+      
+      // Sortiere nach Datum (neueste zuerst)
+      allTrades.sort((a, b) => new Date(b.transactionDate) - new Date(a.transactionDate));
       
       return res.json({
         success: true,
-        count: demoTrades.length,
-        trades: demoTrades,
-        source: 'SEC EDGAR API (Live)',
-        includedTypes: ['Form 4']
+        count: allTrades.length,
+        trades: allTrades.slice(0, parseInt(limit)),
+        source: 'SEC EDGAR API - Real Data',
+        debug: debug === 'true' ? debugInfo : undefined
       });
     }
     
@@ -102,7 +260,7 @@ export default async function handler(req, res) {
       });
     }
     
-    // CIK lookup
+    // Spezifischer Ticker
     const cik = COMPANY_CIKS[ticker.toUpperCase()];
     if (!cik) {
       return res.status(404).json({ 
@@ -111,14 +269,14 @@ export default async function handler(req, res) {
       });
     }
     
-    // Fetch SEC submissions
+    // Submissions laden
     const submissionsUrl = `https://data.sec.gov/submissions/CIK${cik}.json`;
-    const response = await fetchWithRetry(submissionsUrl);
-    const data = await response.json();
+    const submissionsResponse = await fetchWithRetry(submissionsUrl);
+    const submissionsData = await submissionsResponse.json();
     
-    // Find Form 4 filings
+    // Form 4 Filings finden
     const form4Indices = [];
-    data.filings.recent.form.forEach((form, index) => {
+    submissionsData.filings.recent.form.forEach((form, index) => {
       if (form === '4' || form === '4/A') {
         form4Indices.push(index);
       }
@@ -132,71 +290,73 @@ export default async function handler(req, res) {
         count: 0,
         trades: [],
         message: `No Form 4 filings found for ${ticker}`,
-        form4Count: 0,
-        includedTypes: ['Form 4']
+        form4Count: 0
       });
     }
     
-    // Create synthetic trades based on real filings
-    const trades = [];
-    const maxFilings = Math.min(form4Indices.length, 5);
+    // Lade und parse XML für echte Daten
+    const allTrades = [];
+    const debugInfo = [];
+    const maxFilings = Math.min(form4Indices.length, parseInt(limit));
     
     for (let i = 0; i < maxFilings; i++) {
       const idx = form4Indices[i];
-      const accessionNumber = data.filings.recent.accessionNumber[idx];
-      const filingDate = data.filings.recent.reportDate[idx];
+      const accessionNumber = submissionsData.filings.recent.accessionNumber[idx];
+      const reportDate = submissionsData.filings.recent.reportDate[idx];
       
-      // Create synthetic insider trade data
-      trades.push({
-        personName: "Insider (Form 4)",
-        title: "Director/Officer",
-        companyName: data.name || ticker + " Inc",
-        ticker: ticker.toUpperCase(),
-        shares: Math.floor(Math.random() * 100000) + 10000,
-        price: Math.floor(Math.random() * 200) + 50,
-        totalValue: 0, // Will be calculated
-        sharesAfter: Math.floor(Math.random() * 1000000) + 100000,
-        transactionDate: filingDate,
-        filingDate: filingDate,
-        transactionType: Math.random() > 0.5 ? "A" : "D",
-        transactionCode: Math.random() > 0.5 ? "P" : "S",
-        ownershipForm: "D",
-        footnotes: `Based on SEC Filing ${accessionNumber}`
-      });
+      try {
+        // XML URL konstruieren
+        const cleanAccession = accessionNumber.replace(/-/g, '');
+        const xmlUrl = `https://www.sec.gov/Archives/edgar/data/${parseInt(cik)}/${cleanAccession}/ownership.xml`;
+        
+        // XML laden und parsen
+        const xmlResponse = await fetchWithRetry(xmlUrl);
+        const xmlText = await xmlResponse.text();
+        const parseResult = parseForm4XML(xmlText);
+        
+        if (parseResult.success && parseResult.transactions.length > 0) {
+          allTrades.push(...parseResult.transactions);
+          debugInfo.push({
+            accessionNumber,
+            reportDate,
+            transactionCount: parseResult.transactions.length,
+            personName: parseResult.debug.personName,
+            xmlUrl: xmlUrl
+          });
+        } else if (parseResult.error) {
+          debugInfo.push({
+            accessionNumber,
+            error: parseResult.error
+          });
+        }
+      } catch (error) {
+        debugInfo.push({
+          accessionNumber,
+          error: error.message
+        });
+      }
     }
     
-    // Calculate total values
-    trades.forEach(trade => {
-      trade.totalValue = Math.round(trade.shares * trade.price);
-    });
-    
-    // Sort by date (newest first)
-    trades.sort((a, b) => new Date(b.transactionDate) - new Date(a.transactionDate));
+    // Sortiere nach Datum (neueste zuerst)
+    allTrades.sort((a, b) => new Date(b.transactionDate) - new Date(a.transactionDate));
     
     res.json({
       success: true,
       ticker: ticker.toUpperCase(),
       cik,
-      count: trades.length,
-      trades: trades,
-      source: 'SEC EDGAR API',
+      count: allTrades.length,
+      trades: allTrades,
+      source: 'SEC EDGAR API - Real Data',
       form4Count: form4Indices.length,
-      includedTypes: ['Form 4'],
-      debug: {
-        totalForm4Filings: form4Indices.length,
-        companyName: data.name,
-        processed: trades.length
-      }
+      debug: debug === 'true' ? debugInfo : undefined
     });
     
   } catch (error) {
     console.error('API Error:', error);
     
-    // Return detailed error for debugging
     res.status(500).json({ 
       success: false,
       error: error.message,
-      stack: error.stack,
       timestamp: new Date().toISOString()
     });
   }
