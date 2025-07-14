@@ -1,0 +1,12 @@
+{
+  "name": "sec-insider-trading-api",
+  "version": "1.0.0",
+  "description": "SEC Form 4 Insider Trading API Backend",
+  "dependencies": {
+    "node-fetch": "^3.3.2",
+    "xml2js": "^0.6.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
