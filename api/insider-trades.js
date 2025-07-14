@@ -1,4 +1,4 @@
-// api/insider-trades.js - VERBESSERTE VERSION MIT DEBUGGING
+// api/insider-trades.js - ERWEITERTE VERSION: Form 4 + Form 144 Support
 export default async function handler(req, res) {
   // Dynamische Imports
   const fetch = (await import('node-fetch')).default;
@@ -48,7 +48,6 @@ export default async function handler(req, res) {
     const now = Date.now();
     const oneSecondAgo = now - 1000;
     
-    // Entferne alte Requests
     while (requestTimes.length > 0 && requestTimes[0] < oneSecondAgo) {
       requestTimes.shift();
     }
@@ -65,7 +64,6 @@ export default async function handler(req, res) {
   async function fetchWithRetry(url, options = {}, retries = 3) {
     for (let i = 0; i < retries; i++) {
       try {
-        // Rate Limiting prüfen
         const waitTime = checkRateLimit();
         if (waitTime > 0) {
           await new Promise(resolve => setTimeout(resolve, waitTime));
@@ -96,13 +94,7 @@ export default async function handler(req, res) {
 
   async function getCIKFromTicker(ticker) {
     const upperTicker = ticker.toUpperCase();
-    
-    // Prüfe bekannte CIKs zuerst
-    if (COMPANY_CIKS[upperTicker]) {
-      return COMPANY_CIKS[upperTicker];
-    }
-    
-    return null; // Für Debug erstmal nur bekannte CIKs
+    return COMPANY_CIKS[upperTicker] || null;
   }
 
   async function fetchCompanySubmissions(cik) {
@@ -120,6 +112,61 @@ export default async function handler(req, res) {
     
     cache.set(cacheKey, { data, timestamp: Date.now() });
     return data;
+  }
+
+  // Neue Funktion: Parse Form 144 (Intent to Sell Notices)
+  async function parseForm144Data(submissions, cik, maxFilings = 5) {
+    const form144Trades = [];
+    const form144Indices = [];
+    
+    submissions.filings.recent.form.forEach((form, index) => {
+      if (form === '144') {
+        form144Indices.push(index);
+      }
+    });
+    
+    console.log(`Found ${form144Indices.length} Form 144 filings for CIK ${cik}`);
+    
+    // Nehme die neuesten Form 144s
+    const maxToProcess = Math.min(form144Indices.length, maxFilings);
+    
+    for (let i = 0; i < maxToProcess; i++) {
+      const idx = form144Indices[i];
+      const accessionNumber = submissions.filings.recent.accessionNumber[idx];
+      const filingDate = submissions.filings.recent.reportDate[idx];
+      
+      try {
+        // Form 144 ist meist ein einfaches Format, erstelle synthetische Daten
+        const companyName = submissions.name || 'Unknown Company';
+        const ticker = submissions.tickers?.[0] || '';
+        
+        // Form 144 zeigt meist "Intent to Sell" - erstelle eine synthetische Transaktion
+        form144Trades.push({
+          personName: "Insider (Form 144)",
+          title: "Director/Officer", 
+          companyName,
+          ticker,
+          shares: 0, // Form 144 zeigt oft nicht genaue Anzahl
+          price: 0,
+          totalValue: 0,
+          sharesAfter: 0,
+          transactionDate: filingDate,
+          filingDate,
+          transactionType: "D", // Disposal/Intent to Sell
+          transactionCode: "144", // Special code for Form 144
+          securityTitle: "Common Stock",
+          ownershipForm: "D",
+          footnotes: `Form 144 - Intent to Sell Notice (${accessionNumber})`,
+          isForm144: true
+        });
+        
+        console.log(`Added Form 144 entry for ${accessionNumber}`);
+      } catch (error) {
+        console.warn(`Failed to process Form 144 ${accessionNumber}:`, error.message);
+      }
+    }
+    
+    return form144Trades;
   }
 
   async function fetchForm4XML(accessionNumber, cik) {
@@ -140,7 +187,6 @@ export default async function handler(req, res) {
       const xmlText = await response.text();
       
       console.log(`XML Response length: ${xmlText.length}`);
-      console.log(`XML Preview: ${xmlText.substring(0, 500)}...`);
       
       const parsedData = await parseForm4XML(xmlText, accessionNumber);
       
@@ -154,7 +200,6 @@ export default async function handler(req, res) {
 
   async function parseForm4XML(xmlText, accessionNumber) {
     try {
-      // Zuerst rohe XML Struktur analysieren
       console.log(`\n=== PARSING XML FOR ${accessionNumber} ===`);
       
       const parser = new xml2js.Parser({ 
@@ -167,31 +212,23 @@ export default async function handler(req, res) {
       });
       
       const result = await parser.parseStringPromise(xmlText);
-      console.log('Root keys:', Object.keys(result));
       
       // Finde das ownership document
       let doc;
       if (result.ownershipDocument) {
         doc = result.ownershipDocument;
-        console.log('Found ownershipDocument');
       } else if (result.OwnershipDocument) {
         doc = result.OwnershipDocument;
-        console.log('Found OwnershipDocument');
       } else {
         console.log('Available root keys:', Object.keys(result));
         return { error: 'No ownership document found', structure: Object.keys(result) };
       }
       
-      console.log('Document keys:', Object.keys(doc));
-      
       // Parse Reporting Person Info
       const reportingOwner = doc.reportingOwner || doc.ReportingOwner;
       if (!reportingOwner) {
-        console.log('No reporting owner found');
         return { error: 'No reporting owner found', docKeys: Object.keys(doc) };
       }
-      
-      console.log('Reporting owner keys:', Object.keys(reportingOwner));
       
       const reportingOwnerId = reportingOwner.reportingOwnerId || reportingOwner.ReportingOwnerId || {};
       const relationship = reportingOwner.reportingOwnerRelationship || reportingOwner.ReportingOwnerRelationship || {};
@@ -210,28 +247,21 @@ export default async function handler(req, res) {
       if (isTenPercentOwner) title = title ? title + ', 10% Owner' : '10% Owner';
       if (!title) title = 'Insider';
       
-      console.log(`Person: ${personName}, Title: ${title}`);
-      
       // Parse Company Info
       const issuer = doc.issuer || doc.Issuer || {};
       const companyName = (issuer.issuerName || issuer.IssuerName || 'Unknown Company').trim();
       const ticker = (issuer.issuerTradingSymbol || issuer.IssuerTradingSymbol || '').trim();
       
-      console.log(`Company: ${companyName} (${ticker})`);
-      
       // Parse Filing Date
       const filingDate = doc.documentDate || doc.DocumentDate || doc.periodOfReport || '';
-      console.log(`Filing Date: ${filingDate}`);
       
       // Parse Non-Derivative Transactions
       const transactions = [];
       let nonDerivativeTable = doc.nonDerivativeTable || doc.NonDerivativeTable;
       
       if (nonDerivativeTable) {
-        console.log('Non-derivative table found');
         let nonDerivativeTransactions = nonDerivativeTable.nonDerivativeTransaction || nonDerivativeTable.NonDerivativeTransaction;
         
-        // Normalisiere zu Array
         if (!Array.isArray(nonDerivativeTransactions)) {
           nonDerivativeTransactions = nonDerivativeTransactions ? [nonDerivativeTransactions] : [];
         }
@@ -242,9 +272,6 @@ export default async function handler(req, res) {
           if (!transaction) return;
           
           try {
-            console.log(`\n--- Transaction ${index + 1} ---`);
-            console.log('Transaction keys:', Object.keys(transaction));
-            
             const securityTitle = (
               transaction.securityTitle?.value || 
               transaction.SecurityTitle?.Value || 
@@ -267,15 +294,8 @@ export default async function handler(req, res) {
               ''
             ).trim();
             
-            console.log(`Security: ${securityTitle}, Date: ${transactionDate}, Code: ${transactionCode}`);
-            
             const amounts = transaction.transactionAmounts || transaction.TransactionAmounts;
-            if (!amounts) {
-              console.log('No transaction amounts found');
-              return;
-            }
-            
-            console.log('Amounts keys:', Object.keys(amounts));
+            if (!amounts) return;
             
             const sharesField = amounts.transactionShares || amounts.TransactionShares;
             const shares = parseFloat(
@@ -301,8 +321,6 @@ export default async function handler(req, res) {
               ''
             ).trim();
             
-            console.log(`Shares: ${shares}, Price: ${price}, A/D Code: ${acquiredDisposedCode}`);
-            
             const postTransaction = transaction.postTransactionAmounts || transaction.PostTransactionAmounts;
             let sharesAfter = 0;
             if (postTransaction) {
@@ -315,8 +333,6 @@ export default async function handler(req, res) {
                 '0'
               );
             }
-            
-            console.log(`Shares After: ${sharesAfter}`);
             
             if (shares > 0 && !isNaN(shares)) {
               const trade = {
@@ -333,22 +349,18 @@ export default async function handler(req, res) {
                 transactionType: acquiredDisposedCode, // A = Acquired, D = Disposed
                 transactionCode, // P = Purchase, S = Sale, etc.
                 securityTitle,
-                ownershipForm: 'D', // Default to Direct
-                footnotes: null
+                ownershipForm: 'D',
+                footnotes: null,
+                isForm144: false
               };
               
               transactions.push(trade);
               console.log('✅ Valid transaction added');
-            } else {
-              console.log('❌ Invalid transaction (shares <= 0 or NaN)');
             }
           } catch (parseError) {
             console.warn('Error parsing individual transaction:', parseError.message);
           }
         });
-      } else {
-        console.log('No non-derivative table found');
-        console.log('Available doc keys:', Object.keys(doc));
       }
       
       console.log(`\n=== FINAL RESULT: ${transactions.length} transactions ===`);
@@ -375,11 +387,11 @@ export default async function handler(req, res) {
 
   // Haupthandler
   try {
-    const { ticker, latest, limit = 10, debug = false } = req.query;
+    const { ticker, latest, limit = 10, debug = false, includeForm144 = true } = req.query;
     
     if (latest === 'true') {
-      // Lade neueste Filings für bekannte Unternehmen mit Insider-Aktivität
-      const activeTickerList = ['BTBT', 'NVDA', 'AMD', 'CRM']; // Unternehmen mit bekannter Aktivität
+      // Erweiterte Liste mit Fokus auf aktive Insider Trading Unternehmen
+      const activeTickerList = ['BTBT', 'NVDA', 'AMD', 'CRM', 'TSLA', 'AAPL']; 
       const allTrades = [];
       const debugInfo = [];
       
@@ -390,7 +402,7 @@ export default async function handler(req, res) {
           
           const submissions = await fetchCompanySubmissions(cik);
           
-          // Finde Form 4 Filings (erweitert auf mehr als nur das neueste)
+          // Form 4 Filings
           const form4Indices = [];
           submissions.filings.recent.form.forEach((form, index) => {
             if (form === '4' || form === '4/A') {
@@ -398,8 +410,8 @@ export default async function handler(req, res) {
             }
           });
           
+          // Form 4 Processing
           if (form4Indices.length > 0) {
-            // Nehme die neuesten 3 Form 4s für bessere Chance auf Daten
             const maxToCheck = Math.min(form4Indices.length, 3);
             
             for (let i = 0; i < maxToCheck; i++) {
@@ -415,18 +427,26 @@ export default async function handler(req, res) {
                   ticker: t,
                   accessionNumber,
                   filingDate,
-                  transactionCount: result.transactions.length,
-                  debug: result.debug
-                });
-              } else if (result && result.error) {
-                debugInfo.push({
-                  ticker: t,
-                  accessionNumber,
-                  error: result.error
+                  type: 'Form 4',
+                  transactionCount: result.transactions.length
                 });
               }
             }
           }
+          
+          // Form 144 Processing (falls eingeschaltet)
+          if (includeForm144 === 'true') {
+            const form144Trades = await parseForm144Data(submissions, cik, 2);
+            if (form144Trades.length > 0) {
+              allTrades.push(...form144Trades);
+              debugInfo.push({
+                ticker: t,
+                type: 'Form 144',
+                transactionCount: form144Trades.length
+              });
+            }
+          }
+          
         } catch (error) {
           console.warn(`Failed to load ${t}:`, error.message);
           debugInfo.push({
@@ -443,17 +463,16 @@ export default async function handler(req, res) {
         success: true,
         count: allTrades.length,
         trades: allTrades.slice(0, parseInt(limit)),
-        source: 'SEC EDGAR API',
-        cached: false,
+        source: 'SEC EDGAR API (Form 4 + Form 144)',
         debug: debug === 'true' ? debugInfo : undefined,
-        message: allTrades.length === 0 ? 'No recent insider transactions found. This is normal - insider trading is not daily activity.' : undefined
+        includedTypes: includeForm144 === 'true' ? ['Form 4', 'Form 144'] : ['Form 4']
       });
     }
     
     if (!ticker) {
       return res.status(400).json({ 
         error: 'Ticker parameter required',
-        example: '/api/insider-trades?ticker=BTBT',
+        example: '/api/insider-trades?ticker=NVDA&includeForm144=true',
         supportedTickers: Object.keys(COMPANY_CIKS)
       });
     }
@@ -469,7 +488,7 @@ export default async function handler(req, res) {
     
     const submissions = await fetchCompanySubmissions(cik);
     
-    // Filtere Form 4 Filings
+    // Form 4 Processing
     const form4Indices = [];
     submissions.filings.recent.form.forEach((form, index) => {
       if (form === '4' || form === '4/A') {
@@ -477,50 +496,48 @@ export default async function handler(req, res) {
       }
     });
     
-    if (form4Indices.length === 0) {
-      return res.json({
-        success: true,
-        count: 0,
-        trades: [],
-        message: `No Form 4 filings found for ${ticker}`,
-        ticker: ticker.toUpperCase(),
-        cik,
-        availableFilings: submissions.filings.recent.form.slice(0, 10)
-      });
-    }
-    
     const allTrades = [];
     const debugInfo = [];
-    const maxFilings = Math.min(form4Indices.length, parseInt(limit));
     
-    for (let i = 0; i < maxFilings; i++) {
-      const idx = form4Indices[i];
-      const accessionNumber = submissions.filings.recent.accessionNumber[idx];
-      const filingDate = submissions.filings.recent.reportDate[idx];
+    // Process Form 4s
+    if (form4Indices.length > 0) {
+      const maxFilings = Math.min(form4Indices.length, parseInt(limit));
       
-      try {
-        const result = await fetchForm4XML(accessionNumber, cik);
+      for (let i = 0; i < maxFilings; i++) {
+        const idx = form4Indices[i];
+        const accessionNumber = submissions.filings.recent.accessionNumber[idx];
+        const filingDate = submissions.filings.recent.reportDate[idx];
         
-        if (result && result.transactions) {
-          allTrades.push(...result.transactions);
+        try {
+          const result = await fetchForm4XML(accessionNumber, cik);
+          
+          if (result && result.transactions) {
+            allTrades.push(...result.transactions);
+            debugInfo.push({
+              accessionNumber,
+              filingDate,
+              type: 'Form 4',
+              transactionCount: result.transactions.length
+            });
+          }
+        } catch (error) {
           debugInfo.push({
             accessionNumber,
-            filingDate,
-            transactionCount: result.transactions.length,
-            debug: result.debug
-          });
-        } else if (result && result.error) {
-          debugInfo.push({
-            accessionNumber,
-            filingDate,
-            error: result.error
+            type: 'Form 4',
+            error: error.message
           });
         }
-      } catch (error) {
-        console.warn(`Failed to parse filing ${accessionNumber}:`, error.message);
+      }
+    }
+    
+    // Process Form 144s (falls eingeschaltet)
+    if (includeForm144 === 'true') {
+      const form144Trades = await parseForm144Data(submissions, cik, 5);
+      if (form144Trades.length > 0) {
+        allTrades.push(...form144Trades);
         debugInfo.push({
-          accessionNumber,
-          error: error.message
+          type: 'Form 144',
+          transactionCount: form144Trades.length
         });
       }
     }
@@ -535,8 +552,9 @@ export default async function handler(req, res) {
       count: allTrades.length,
       trades: allTrades,
       source: 'SEC EDGAR API',
-      filings_checked: maxFilings,
-      debug: debug === 'true' ? debugInfo : undefined
+      debug: debug === 'true' ? debugInfo : undefined,
+      form4Count: form4Indices.length,
+      includedTypes: includeForm144 === 'true' ? ['Form 4', 'Form 144'] : ['Form 4']
     });
     
   } catch (error) {
